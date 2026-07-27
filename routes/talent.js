@@ -158,7 +158,7 @@ router.post('/:id/suggest-skills', requireManager, async (req, res) => {
     if (genAI) {
       // Using application/json guarantees Gemini returns a parsable array, avoiding regex hacks
       const model = genAI.getGenerativeModel({ 
-        model: 'gemini-1.5-flash',
+        model: 'gemini-2.5-flash',
         generationConfig: { temperature: 0.4, responseMimeType: 'application/json' }
       });
       

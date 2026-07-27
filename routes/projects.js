@@ -168,7 +168,7 @@ router.post('/:projectId/vault-analysis', async (req, res) => {
     let insightContent = "";
 
     if (genAI && project.files.length > 0) {
-      const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash', generationConfig: { temperature: 0.2, responseMimeType: 'application/json' } });
+      const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash', generationConfig: { temperature: 0.2, responseMimeType: 'application/json' } });
       const prompt = `You are a Senior Technical Project Manager. Project Name: ${project.title}. 
       The team uploaded these files: ${fileNames}.
       Review context and generate analysis. 
@@ -249,7 +249,7 @@ router.post('/:projectId/agent-swarm', async (req, res) => {
     }
 
     const model = genAI.getGenerativeModel({
-      model: 'gemini-1.5-flash',
+      model: 'gemini-2.5-flash',
       generationConfig: { temperature: 0.3, responseMimeType: 'application/json' }
     });
 

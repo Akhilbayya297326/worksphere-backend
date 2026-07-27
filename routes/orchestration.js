@@ -40,7 +40,7 @@ router.post('/vision-orchestrate', uploadMemory.single('image'), async (req, res
     const imageBase64 = file.buffer.toString('base64');
     const imagePart = { inlineData: { data: imageBase64, mimeType: file.mimetype } };
 
-    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash', generationConfig: { temperature: 0.2, responseMimeType: 'application/json' } });
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash', generationConfig: { temperature: 0.2, responseMimeType: 'application/json' } });
 
     const prompt = `
       You are an elite Principal Software Architect.
@@ -99,7 +99,7 @@ router.post('/draft-plan/:projectId', async (req, res) => {
 
     if (!genAI) return res.status(500).json({ success: false, error: "Gemini API key missing." });
 
-    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash', generationConfig: { temperature: 0.2, responseMimeType: 'application/json' } });
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash', generationConfig: { temperature: 0.2, responseMimeType: 'application/json' } });
 
     const prompt = `
       Act as the Tech Lead / Engineering Manager helper.
