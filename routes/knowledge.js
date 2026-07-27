@@ -24,7 +24,7 @@ router.post('/query', async (req, res) => {
 
     // 2. Configure Gemini Model with Native JSON Structuring
     const model = genAI.getGenerativeModel({ 
-      model: 'gemini-2.5-flash', // Uses your exact requested model
+      model: 'gemini-2.5-flash', 
       generationConfig: { 
         temperature: 0.1, 
         responseMimeType: 'application/json' 
