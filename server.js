@@ -11,8 +11,12 @@ const Message = require('./models/Message');
 const app = express();
 const server = http.createServer(app);
 
-// 1. Core Middleware
-app.use(cors({ origin: '*' }));
+// 1. Core Middleware (Strengthened for Render <-> Vercel communication)
+app.use(cors({ 
+  origin: '*', 
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  credentials: true
+}));
 app.use(express.json());
 
 // 2. Database Connection
@@ -22,7 +26,11 @@ mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/worksphere'
 
 // 3. Real-Time WebSockets Engine
 const io = new Server(server, { 
-  cors: { origin: '*', methods: ["GET", "POST", "PUT", "DELETE"] } 
+  cors: { 
+    origin: '*', 
+    methods: ["GET", "POST", "PUT", "DELETE"],
+    credentials: true
+  } 
 });
 
 // 🚀 CRITICAL: Expose 'io' to the rest of the backend for automated triggers
@@ -83,7 +91,7 @@ io.on('connection', (socket) => {
   });
 });
 
-// 🩺 Health Check Route (Fixes "Cannot GET /" on Render)
+// 🩺 Health Check Route
 app.get('/', (req, res) => {
   res.status(200).send('🚀 WorkSphere AI Backend is up and running live on Render!');
 });
@@ -93,7 +101,11 @@ app.use('/api/auth', require('./routes/auth'));
 app.use('/api/talent', require('./routes/talent'));
 app.use('/api/projects', require('./routes/projects'));
 app.use('/api/orchestration', require('./routes/orchestration')); 
-app.use('/api/chat', require('./routes/chat')); // 👈 Route for history
+app.use('/api/chat', require('./routes/chat'));
+app.use('/api/knowledge', require('./routes/knowledge'));
+
+// 🚀 ADDED MISSING KNOWLEDGE ROUTE HERE
+try { app.use('/api/knowledge', require('./routes/knowledge')); } catch (e) { console.warn("Knowledge route skipped"); }
 
 // Fallbacks
 try { app.use('/api/integrations', require('./routes/integrations')); } catch (e) {}
@@ -106,5 +118,5 @@ server.listen(PORT, () => {
   console.log(`⚡ Telemetry & Real-Time Sockets Active`);
 });
 
-// 🚀 CRITICAL FOR VERCEL: Export the app so Vercel can convert it to Serverless Functions
+// (Left in just in case you ever move back to Vercel, though Render ignores this)
 module.exports = app;
