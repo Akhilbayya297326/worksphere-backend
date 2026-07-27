@@ -83,6 +83,11 @@ io.on('connection', (socket) => {
   });
 });
 
+// 🩺 Health Check Route (Fixes "Cannot GET /" on Render)
+app.get('/', (req, res) => {
+  res.status(200).send('🚀 WorkSphere AI Backend is up and running live on Render!');
+});
+
 // 4. REST API Routes
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/talent', require('./routes/talent'));
@@ -100,3 +105,6 @@ server.listen(PORT, () => {
   console.log(`🚀 WorkSphere AI Backend running on port ${PORT}`);
   console.log(`⚡ Telemetry & Real-Time Sockets Active`);
 });
+
+// 🚀 CRITICAL FOR VERCEL: Export the app so Vercel can convert it to Serverless Functions
+module.exports = app;
