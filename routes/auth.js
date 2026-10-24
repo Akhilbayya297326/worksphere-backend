@@ -5,24 +5,13 @@ const Employee = require('../models/Employee');
 // POST: Enterprise Login Gateway
 router.post('/login', async (req, res) => {
   try {
-    const { email, password } = req.body;
-    const isDemoMode = password === 'cisco2026';
-
-    let user = await Employee.findOne({ email });
-
-    // Fail-safe: If DB is empty, auto-approve the demo admin for presentation purposes
-    if (!user && email === 'admin@worksphere.com' && isDemoMode) {
-      return res.json({
-        success: true,
-        user: { _id: 'demo-admin-id', name: 'WorkSphere Admin', role: 'Manager', email: email }
-      });
+    const { email, password } = req.body || {};
+    if (typeof email !== 'string' || !email.trim() || typeof password !== 'string' || !password) {
+      return res.status(400).json({ success: false, error: 'Email and password are required.' });
     }
 
-    if (!user) {
-      return res.status(404).json({ success: false, error: 'Enterprise account not found.' });
-    }
-
-    if (!isDemoMode && user.password !== password) {
+    const user = await Employee.findOne({ email: email.trim().toLowerCase() }).select('+password');
+    if (!user || user.password !== password) {
       return res.status(401).json({ success: false, error: 'Invalid credentials.' });
     }
 

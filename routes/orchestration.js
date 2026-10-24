@@ -1,46 +1,87 @@
 const express = require('express');
 const router = express.Router();
 const multer = require('multer');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+const mongoose = require('mongoose');
+const { generateJson, HttpError, sendError, requireText, isRecord, isStringArray } = require('../utils/ai');
 
 const Project = require('../models/Project');
 const Employee = require('../models/Employee');
 const Message = require('../models/Message');
 
-const genAI = process.env.GEMINI_API_KEY ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY) : null;
-
 // Memory storage for fast multimodal image buffer parsing (Whiteboard Vision)
-const uploadMemory = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+const imageTypes = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/heic', 'image/heif']);
+const uploadMemory = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024, files: 1, fields: 5, fieldSize: 10000 },
+  fileFilter: (req, file, callback) => callback(imageTypes.has(file.mimetype) ? null
+    : new HttpError(400, 'Upload a PNG, JPEG, WebP, HEIC, or HEIF image.'), imageTypes.has(file.mimetype))
+});
+const uploadImage = (req, res, next) => uploadMemory.single('image')(req, res, error => {
+  if (!error) return next();
+  return sendError(res, error instanceof multer.MulterError
+    ? new HttpError(error.code === 'LIMIT_FILE_SIZE' ? 413 : 400,
+      error.code === 'LIMIT_FILE_SIZE' ? 'Image must be 10 MB or smaller.' : 'Invalid image upload.') : error,
+  'Failed to upload whiteboard image.');
+});
+
+function validateProjectId(value) {
+  if (!mongoose.isObjectIdOrHexString(value)) throw new HttpError(400, 'Invalid project ID.');
+}
+
+function normalizeTasks(tasks) {
+  if (!Array.isArray(tasks) || !tasks.length || tasks.length > 100) {
+    throw new HttpError(400, 'Provide between 1 and 100 finalized tasks.');
+  }
+  return tasks.map(task => {
+    if (!isRecord(task)) throw new HttpError(400, 'Each task must be an object.');
+    if (task.description !== undefined && typeof task.description !== 'string') throw new HttpError(400, 'Task description must be a string.');
+    const complexity = task.complexity ?? 'Medium';
+    if (!['Low', 'Medium', 'High', 'Critical'].includes(complexity)) throw new HttpError(400, 'Invalid task complexity.');
+    return {
+      title: requireText(task.title, 'Task title', 500), description: task.description || '', complexity,
+      assignedTo: requireText(task.assignedTo, 'Assigned employee', 200),
+      status: 'To Do'
+    };
+  });
+}
+
+async function resolveTasks(tasks, team = []) {
+  const assignments = tasks.map(task => task.assignedTo);
+  const names = [...new Set([...assignments, ...team.map(person => person.name)])];
+  const ids = assignments.filter(value => mongoose.isObjectIdOrHexString(value));
+  const employees = await Employee.find({ $or: [{ name: { $in: names } }, { _id: { $in: ids } }] });
+  const resolvedTasks = tasks.map(task => {
+    const idMatch = employees.find(employee => String(employee._id).toLowerCase() === task.assignedTo.toLowerCase());
+    const nameMatches = employees.filter(employee => employee.name === task.assignedTo);
+    const employee = idMatch || (nameMatches.length === 1 ? nameMatches[0] : null);
+    if (!employee) throw new HttpError(400, 'An assigned employee does not exist or has an ambiguous name. Refresh the team and try again.');
+    return { ...task, assignedTo: employee._id };
+  });
+  const resolvedTeam = team.map(person => {
+    const matches = employees.filter(employee => employee.name === person.name);
+    const employee = matches.find(item => String(item._id) === person.employeeId) || (matches.length === 1 ? matches[0] : null);
+    if (!employee) throw new HttpError(400, 'A shortlisted employee does not exist or has an ambiguous name. Refresh the team and try again.');
+    return { employeeId: employee._id, name: employee.name, role: employee.role, reason: person.reason || person.matchReason || '' };
+  });
+  return { tasks: resolvedTasks, team: resolvedTeam };
+}
 
 // ============================================================================
 // ROUTE 1: MULTIMODAL WHITEBOARD VISION ORCHESTRATOR
 // ============================================================================
-router.post('/vision-orchestrate', uploadMemory.single('image'), async (req, res) => {
+router.post('/vision-orchestrate', uploadImage, async (req, res) => {
   try {
-    const { title } = req.body;
+    const title = requireText(req.body?.title, 'Project title', 500);
     const file = req.file;
+    if (!file || !file.buffer?.length) throw new HttpError(400, 'A whiteboard image is required.');
+    if (!imageTypes.has(file.mimetype)) throw new HttpError(400, 'Unsupported image type.');
+    if (!process.env.GEMINI_API_KEY?.trim()) throw new HttpError(503, 'AI service is not configured. Set GEMINI_API_KEY on the backend.');
 
     const availableTalent = await Employee.find({ availability: 'Available' }).select('name role skills technologiesKnown');
-
-    if (!genAI || !file) {
-      // High-quality fallback for demonstration without API keys
-      return res.json({
-        success: true,
-        projectTitle: title || "Agile Whiteboard Initiative",
-        shortlistedTeam: availableTalent.slice(0, 3).map(e => ({ name: e.name, role: e.role, matchReason: "Matched from visual architecture pattern." })),
-        draftedTasks: Array.from({ length: 12 }, (_, i) => ({
-          title: `Task #${i + 1}: ${['Database Schema Setup', 'Auth Middleware', 'API Gateway Route', 'UI Wireframe Component', 'State Management', 'Integration Tests', 'Docker Containerization', 'Redis Caching', 'CI/CD Pipeline', 'Security Audit', 'Telemetry Stream', 'Production Deployment'][i]}`,
-          description: `Extracted from whiteboard diagram node #${i + 1}. High priority execution unit.`,
-          complexity: i % 3 === 0 ? 'High' : 'Medium',
-          assignedTo: availableTalent[i % availableTalent.length]?.name || 'Rahul Verma'
-        }))
-      });
-    }
+    if (!availableTalent.length) throw new HttpError(400, 'No available employees found for this project.');
 
     const imageBase64 = file.buffer.toString('base64');
     const imagePart = { inlineData: { data: imageBase64, mimeType: file.mimetype } };
-
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash', generationConfig: { temperature: 0.2, responseMimeType: 'application/json' } });
 
     const prompt = `
       You are an elite Principal Software Architect.
@@ -65,9 +106,16 @@ router.post('/vision-orchestrate', uploadMemory.single('image'), async (req, res
       }
     `;
 
-    const result = await model.generateContent([prompt, imagePart]);
-    let responseText = result.response.text().replace(/```json/gi, '').replace(/```/g, '').trim();
-    const parsedData = JSON.parse(responseText);
+    const parsedData = await generateJson([prompt, imagePart], data =>
+      Array.isArray(data.shortlistedTeam) && data.shortlistedTeam.every(person => isRecord(person) && typeof person.name === 'string') &&
+      Array.isArray(data.draftedTasks) && data.draftedTasks.length > 0 && data.draftedTasks.length <= 100 &&
+      data.draftedTasks.every(task => isRecord(task) && typeof task.title === 'string' && task.title.trim() &&
+        typeof task.description === 'string' && ['Low', 'Medium', 'High'].includes(task.complexity)), { temperature: 0.2 });
+    parsedData.shortlistedTeam = parsedData.shortlistedTeam.flatMap(person => {
+      const employee = availableTalent.find(item => item.name === person.name);
+      return employee ? [{ name: employee.name, role: employee.role, matchReason: typeof person.matchReason === 'string' ? person.matchReason : '' }] : [];
+    });
+    if (!parsedData.shortlistedTeam.length) throw new HttpError(502, 'AI service did not select any available employees. Please try again.');
 
     res.json({
       success: true,
@@ -76,8 +124,7 @@ router.post('/vision-orchestrate', uploadMemory.single('image'), async (req, res
       draftedTasks: parsedData.draftedTasks
     });
   } catch (err) {
-    console.error("Vision Orchestration Error:", err);
-    res.status(500).json({ success: false, error: 'Failed to parse whiteboard drawing.' });
+    sendError(res, err, 'Failed to parse whiteboard drawing.');
   }
 });
 
@@ -86,6 +133,7 @@ router.post('/vision-orchestrate', uploadMemory.single('image'), async (req, res
 // ============================================================================
 router.post('/draft-plan/:projectId', async (req, res) => {
   try {
+    validateProjectId(req.params.projectId);
     const project = await Project.findById(req.params.projectId);
     if (!project) return res.status(404).json({ success: false, error: "Project not found." });
 
@@ -96,10 +144,6 @@ router.post('/draft-plan/:projectId', async (req, res) => {
     const cleanTalentPool = availableTalent.map(emp => ({
       id: emp._id.toString(), name: emp.name, role: emp.role, skills: emp.skills, technologies: emp.technologiesKnown, experience: emp.experienceYears
     }));
-
-    if (!genAI) return res.status(500).json({ success: false, error: "Gemini API key missing." });
-
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash', generationConfig: { temperature: 0.2, responseMimeType: 'application/json' } });
 
     const prompt = `
       Act as the Tech Lead / Engineering Manager helper.
@@ -126,25 +170,30 @@ router.post('/draft-plan/:projectId', async (req, res) => {
       }
     `;
 
-    const result = await model.generateContent(prompt);
-    let responseText = result.response.text().replace(/```json/gi, '').replace(/```/g, '').trim();
-    const draftData = JSON.parse(responseText);
+    const kbKeys = ['systemArchitecture', 'coreFeatures', 'databaseDesign', 'setupInstructions', 'qaTestingStrategy'];
+    const draftData = await generateJson(prompt, data =>
+      Array.isArray(data.shortlistedTeam) && data.shortlistedTeam.length > 0 &&
+      data.shortlistedTeam.every(person => isRecord(person) && typeof person.employeeId === 'string' &&
+        availableTalent.some(employee => String(employee._id) === person.employeeId)) &&
+      Array.isArray(data.draftedTasks) && data.draftedTasks.length > 0 && data.draftedTasks.length <= 100 &&
+      data.draftedTasks.every(task => isRecord(task) && typeof task.title === 'string' && task.title.trim() &&
+        typeof task.description === 'string' && ['Low', 'Medium', 'High'].includes(task.complexity)) &&
+      isRecord(data.projectKnowledgeBase) && kbKeys.every(key =>
+        typeof data.projectKnowledgeBase[key] === 'string' || isStringArray(data.projectKnowledgeBase[key])), { temperature: 0.2 });
 
     const kb = draftData.projectKnowledgeBase;
-    if (kb) {
-      if (Array.isArray(kb.coreFeatures)) kb.coreFeatures = "• " + kb.coreFeatures.join('\n• ');
-      if (Array.isArray(kb.setupInstructions)) kb.setupInstructions = "• " + kb.setupInstructions.join('\n• ');
-      if (Array.isArray(kb.qaTestingStrategy)) kb.qaTestingStrategy = "• " + kb.qaTestingStrategy.join('\n• ');
-    }
+    for (const key of kbKeys) if (Array.isArray(kb[key])) kb[key] = kb[key].join('\n');
 
-    project.aiShortlistedTeam = draftData.shortlistedTeam;
+    project.aiShortlistedTeam = draftData.shortlistedTeam.map(person => {
+      const employee = availableTalent.find(item => String(item._id) === person.employeeId);
+      return { employeeId: employee._id, name: employee.name, role: employee.role, reason: typeof person.matchReason === 'string' ? person.matchReason : '' };
+    });
     project.projectKnowledgeBase = draftData.projectKnowledgeBase; 
     await project.save();
 
     res.json({ success: true, project, draftedTasks: draftData.draftedTasks });
   } catch (err) {
-    console.error("AI Drafting Error:", err);
-    res.status(500).json({ success: false, error: 'AI drafting failed.' });
+    sendError(res, err, 'AI drafting failed.');
   }
 });
 
@@ -153,17 +202,19 @@ router.post('/draft-plan/:projectId', async (req, res) => {
 // ============================================================================
 router.post('/confirm-allocation/:projectId', async (req, res) => {
   try {
+    validateProjectId(req.params.projectId);
+    const tasks = normalizeTasks(req.body?.finalizedTasks);
     const project = await Project.findById(req.params.projectId);
     if (!project) return res.status(404).json({ success: false, error: "Project not found." });
 
-    project.allocatedTasks = req.body.finalizedTasks; 
+    const resolved = await resolveTasks(tasks);
+    project.allocatedTasks = resolved.tasks;
     project.status = 'Development'; 
     await project.save();
     
     res.json({ success: true, project });
   } catch (err) {
-    console.error("Manager Confirmation Error:", err);
-    res.status(500).json({ success: false, error: 'Manager confirmation failed.' });
+    sendError(res, err, 'Manager confirmation failed.');
   }
 });
 
@@ -172,31 +223,40 @@ router.post('/confirm-allocation/:projectId', async (req, res) => {
 // ============================================================================
 router.post('/dispatch', async (req, res) => {
   try {
-    const { title, aiShortlistedTeam, finalizedTasks, repositories } = req.body;
-
-    const tasksWithIds = await Promise.all(finalizedTasks.map(async (task) => {
-      const emp = await Employee.findOne({ name: task.assignedTo });
-      return {
-        title: task.title,
-        description: task.description,
-        complexity: task.complexity || 'Medium',
-        assignedTo: emp ? emp._id : null,
-        status: 'To Do'
-      };
-    }));
+    const { title, aiShortlistedTeam = [], finalizedTasks, repositories = [] } = req.body || {};
+    const projectTitle = requireText(title ?? 'Enterprise Initiative', 'Project title', 500);
+    const tasks = normalizeTasks(finalizedTasks);
+    if (!Array.isArray(aiShortlistedTeam) || aiShortlistedTeam.length > 100 ||
+      aiShortlistedTeam.some(person => !isRecord(person) || typeof person.name !== 'string' || !person.name.trim() ||
+        (person.reason !== undefined && typeof person.reason !== 'string') ||
+        (person.matchReason !== undefined && typeof person.matchReason !== 'string'))) {
+      throw new HttpError(400, 'Invalid shortlisted team.');
+    }
+    if (!Array.isArray(repositories) || repositories.length > 20) throw new HttpError(400, 'Invalid repository list.');
+    const cleanRepositories = repositories.map(repository => {
+      if (!isRecord(repository) || !['Frontend', 'Backend', 'Fullstack', 'Microservice', 'Other'].includes(repository.repoType)) {
+        throw new HttpError(400, 'Invalid repository type.');
+      }
+      let url;
+      try { url = new URL(requireText(repository.url, 'Repository URL', 2000)); } catch { throw new HttpError(400, 'Invalid repository URL.'); }
+      if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new HttpError(400, 'Repository URL must use HTTP or HTTPS without credentials.');
+      return { repoType: repository.repoType, url: url.href };
+    });
+    const resolved = await resolveTasks(tasks, aiShortlistedTeam);
+    const tasksWithIds = resolved.tasks;
 
     const newProject = await Project.create({
-      title: title || 'Enterprise Initiative',
+      title: projectTitle,
       status: 'In Progress',
-      aiShortlistedTeam: aiShortlistedTeam || [],
+      aiShortlistedTeam: resolved.team,
       allocatedTasks: tasksWithIds,
-      repositories: repositories || []
+      repositories: cleanRepositories
     });
 
     // 🚀 Broadcast system alert to Comm-Link
     try {
       const io = req.app.get('io');
-      const teamNames = aiShortlistedTeam.map(t => t.name).join(', ') || 'Allocated Staff';
+      const teamNames = resolved.team.map(t => t.name).join(', ') || 'Allocated Staff';
 
       const announcement = await Message.create({
         author: 'WorkSphere Orchestrator',
@@ -209,13 +269,12 @@ router.post('/dispatch', async (req, res) => {
 
       if (io) io.emit('receive_message', announcement);
     } catch (e) {
-      console.error("Chat Broadcast failed:", e);
+      console.error('Chat broadcast failed after project creation.');
     }
 
     res.json({ success: true, project: newProject });
   } catch (err) {
-    console.error("Dispatch Error:", err);
-    res.status(500).json({ success: false, error: 'Failed to dispatch initiative.' });
+    sendError(res, err, 'Failed to dispatch initiative.');
   }
 });
 

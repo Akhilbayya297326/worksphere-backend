@@ -2,13 +2,28 @@ const express = require('express');
 const router = express.Router();
 const mongoose = require('mongoose');
 const Employee = require('../models/Employee');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+const { generateJson, HttpError, sendError, isRecord, isStringArray, requireText } = require('../utils/ai');
 
-// Safely mock requireManager to prevent 403 Forbidden errors during demo
-const requireManager = (req, res, next) => next();
+const { requireManager } = require('../middleware/auth');
 
-// Conditionally initialize AI to prevent server crashes if key is missing
-const genAI = process.env.GEMINI_API_KEY ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY) : null;
+router.param('id', (req, res, next, id) => {
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    return res.status(400).json({ success: false, error: 'Invalid Employee ID.' });
+  }
+  next();
+});
+
+function normalizeSkills(value, label = 'Skills') {
+  if (value === undefined) return [];
+  const items = typeof value === 'string' ? value.split(',') : value;
+  if (!isStringArray(items)) throw new HttpError(400, `${label} must be a string array or comma-separated string.`);
+  return [...new Set(items.map(skill => skill.trim()).filter(Boolean))];
+}
+
+function employeeError(res, error, fallback) {
+  if (error.code === 11000) return res.status(409).json({ success: false, error: 'An employee with that email already exists.' });
+  return sendError(res, error, fallback);
+}
 
 // ==========================================
 // 🧑‍💻 CRUD ROUTES
@@ -27,14 +42,14 @@ router.get('/', async (req, res) => {
 });
 
 // POST: Add a new employee
-router.post('/add', async (req, res) => {
+router.post('/add', requireManager, async (req, res) => {
   try {
-    const { name, role, skills, email, department } = req.body;
-    const skillArray = skills ? skills.split(',').map(skill => skill.trim()) : [];
+    const { name, role, skills, email, department } = req.body || {};
+    const skillArray = normalizeSkills(skills);
 
     const newEmployee = new Employee({
-      name,
-      email,
+      name: requireText(name, 'Name', 200),
+      email: requireText(email, 'Email', 320),
       password: 'EnterpriseDefault123!', 
       role: role || 'Developer',
       department: department || 'Engineering',
@@ -46,8 +61,7 @@ router.post('/add', async (req, res) => {
     await newEmployee.save();
     res.status(201).json({ success: true, employee: newEmployee });
   } catch (err) {
-    console.error("Add Employee Error:", err);
-    res.status(500).json({ success: false, error: err.message });
+    employeeError(res, err, 'Failed to add employee.');
   }
 });
 
@@ -58,9 +72,19 @@ router.put('/:id', requireManager, async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid Employee ID.' });
     }
 
+    if (!isRecord(req.body)) throw new HttpError(400, 'Employee details must be an object.');
+    const allowedFields = ['name', 'email', 'role', 'department', 'availability', 'skills', 'technologiesKnown', 'certifications', 'experienceYears', 'previousProjects', 'performanceHistory', 'aiSuggestedSkills'];
+    const update = Object.fromEntries(allowedFields.filter(field => Object.hasOwn(req.body, field)).map(field => [field, req.body[field]]));
+    for (const field of ['skills', 'technologiesKnown', 'certifications', 'previousProjects', 'aiSuggestedSkills']) {
+      if (Object.hasOwn(update, field)) update[field] = normalizeSkills(update[field], field);
+    }
+    for (const field of ['name', 'email']) {
+      if (Object.hasOwn(update, field)) update[field] = requireText(update[field], field, 320);
+    }
+    if (!Object.keys(update).length) throw new HttpError(400, 'No editable employee fields provided.');
     const updatedEmployee = await Employee.findByIdAndUpdate(
       req.params.id, 
-      { $set: req.body }, 
+      { $set: update },
       { new: true, runValidators: true }
     );
     
@@ -68,8 +92,7 @@ router.put('/:id', requireManager, async (req, res) => {
     
     res.json({ success: true, employee: updatedEmployee });
   } catch (err) {
-    console.error("Edit Employee Error:", err);
-    res.status(400).json({ success: false, error: err.message });
+    employeeError(res, err, 'Failed to update employee.');
   }
 });
 
@@ -85,8 +108,7 @@ router.delete('/:id', requireManager, async (req, res) => {
 
     res.json({ success: true, message: 'Employee permanently removed.' });
   } catch (err) {
-    console.error("Delete Employee Error:", err);
-    res.status(500).json({ success: false, error: err.message });
+    employeeError(res, err, 'Failed to delete employee.');
   }
 });
 
@@ -100,15 +122,7 @@ router.post('/:id/roadmap', async (req, res) => {
     const employee = await Employee.findById(req.params.id);
     if (!employee) return res.status(404).json({ success: false, error: 'Employee not found.' });
 
-    let roadmapData;
-
-    if (genAI) {
-      const model = genAI.getGenerativeModel({ 
-        model: 'gemini-2.5-flash', 
-        generationConfig: { temperature: 0.3, responseMimeType: 'application/json' } 
-      });
-
-      const prompt = `You are an expert Enterprise Career Coach. Analyze this employee:
+    const prompt = `You are an expert Enterprise Career Coach. Analyze this employee:
       Name: ${employee.name}
       Role: ${employee.role}
       Current Skills: ${employee.skills?.join(', ') || 'General IT'}
@@ -126,24 +140,14 @@ router.post('/:id/roadmap', async (req, res) => {
         ]
       }`;
 
-      const result = await model.generateContent(prompt);
-      roadmapData = JSON.parse(result.response.text());
-    } else {
-      // Fallback if no API key is set
-      roadmapData = {
-        executiveSummary: "AI Engine offline. Manual review required.",
-        strengths: employee.skills || ["Reliable team member"],
-        areasForImprovement: ["Advanced Cloud Architecture", "System Design"],
-        actionPlan: [
-          { phase: "Phase 1: Immediate (0-30 Days)", action: "Review current enterprise tech stack." }
-        ]
-      };
-    }
+    const roadmapData = await generateJson(prompt, value => typeof value.executiveSummary === 'string'
+      && isStringArray(value.strengths) && isStringArray(value.areasForImprovement)
+      && Array.isArray(value.actionPlan) && value.actionPlan.every(step => isRecord(step)
+        && typeof step.phase === 'string' && typeof step.action === 'string'), { temperature: 0.3 });
 
     res.json({ success: true, roadmap: roadmapData });
   } catch (err) {
-    console.error("AI Roadmap Error:", err);
-    res.status(500).json({ success: false, error: 'Failed to generate career roadmap.' });
+    sendError(res, err, 'Failed to generate career roadmap.');
   }
 });
 
@@ -153,30 +157,19 @@ router.post('/:id/suggest-skills', requireManager, async (req, res) => {
     const employee = await Employee.findById(req.params.id);
     if (!employee) return res.status(404).json({ success: false, error: 'Employee not found.' });
 
-    let suggestions = [];
-
-    if (genAI) {
-      // Using application/json guarantees Gemini returns a parsable array, avoiding regex hacks
-      const model = genAI.getGenerativeModel({ 
-        model: 'gemini-2.5-flash',
-        generationConfig: { temperature: 0.4, responseMimeType: 'application/json' }
-      });
-      
-      const prompt = `Act as an Enterprise HR Tech AI. Analyze this developer's profile and suggest exactly 3 high-impact technologies they should learn to support their current stack and increase their value to the company.
+    const prompt = `Act as an Enterprise HR Tech AI. Analyze this developer's profile and suggest exactly 3 high-impact technologies they should learn to support their current stack and increase their value to the company.
       Role: ${employee.role}
-      Experience: ${employee.experienceYears || 'Unknown'} years
+      Experience: ${employee.experienceYears ?? 'Unknown'} years
       Current Skills: ${(employee.skills || []).join(', ')}
       Technologies Known: ${(employee.technologiesKnown || []).join(', ')}
       
-      CRITICAL INSTRUCTION: Respond ONLY with a valid JSON array of strings containing exactly 3 technologies. 
-      Example format: ["Docker", "Kubernetes", "GraphQL"]`;
+      CRITICAL INSTRUCTION: Respond ONLY with a JSON object containing exactly 3 technologies.
+      Example format: {"suggestions": ["Docker", "Kubernetes", "GraphQL"]}`;
 
-      const result = await model.generateContent(prompt);
-      suggestions = JSON.parse(result.response.text());
-    } else {
-      // Fallback if no API key is set
-      suggestions = ["Docker", "Kubernetes", "GraphQL"];
-    }
+    const data = await generateJson(prompt, value => isStringArray(value.suggestions)
+      && value.suggestions.length === 3 && value.suggestions.every(skill => skill.trim())
+      && new Set(value.suggestions.map(skill => skill.trim())).size === 3, { temperature: 0.4 });
+    const suggestions = normalizeSkills(data.suggestions);
 
     // Update the employee in the database
     employee.aiSuggestedSkills = suggestions;
@@ -184,8 +177,7 @@ router.post('/:id/suggest-skills', requireManager, async (req, res) => {
 
     res.json({ success: true, suggestions, employee });
   } catch (err) {
-    console.error("Gemini AI Skills Error:", err);
-    res.status(500).json({ success: false, error: 'AI Analysis failed.' });
+    sendError(res, err, 'AI Analysis failed.');
   }
 });
 

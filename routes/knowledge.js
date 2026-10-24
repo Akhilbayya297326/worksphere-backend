@@ -1,16 +1,10 @@
 const express = require('express');
 const router = express.Router();
-const { GoogleGenerativeAI } = require('@google/generative-ai');
-
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const { generateJson, sendError, requireText, isStringArray } = require('../utils/ai');
 
 router.post('/query', async (req, res) => {
   try {
-    const { query } = req.body;
-    
-    if (!query) {
-      return res.status(400).json({ success: false, error: 'Query is required.' });
-    }
+    const query = requireText(req.body?.query, 'Query', 10000);
 
     // 1. Simulated Vector Database Retrieval (ChromaDB Mock)
     const retrievedContext = `
@@ -21,15 +15,6 @@ router.post('/query', async (req, res) => {
       Document: auth-service/README.md (GitHub)
       The API Gateway validates the token before allowing access to protected services.
     `;
-
-    // 2. Configure Gemini Model with Native JSON Structuring
-    const model = genAI.getGenerativeModel({ 
-      model: 'gemini-2.5-flash', 
-      generationConfig: { 
-        temperature: 0.1, 
-        responseMimeType: 'application/json' 
-      } 
-    });
 
     const prompt = `
       You are the WorkSphere AI Enterprise Knowledge Copilot.
@@ -56,14 +41,15 @@ router.post('/query', async (req, res) => {
       }
     `;
 
-    const result = await model.generateContent(prompt);
-    const structuredData = JSON.parse(result.response.text());
+    const structuredData = await generateJson(prompt, data =>
+      typeof data.overview === 'string' && typeof data.technicalDetails === 'string' &&
+      isStringArray(data.keyPoints) && isStringArray(data.actionItems) && isStringArray(data.sources) &&
+      typeof data.confidenceScore === 'string');
 
-    res.json({ success: true, data: structuredData });
+    res.json({ success: true, data: structuredData, contextType: 'sample' });
 
   } catch (err) {
-    console.error("Knowledge Copilot Error:", err);
-    res.status(500).json({ success: false, error: 'Failed to process knowledge query.' });
+    sendError(res, err, 'Failed to process knowledge query.');
   }
 });
 

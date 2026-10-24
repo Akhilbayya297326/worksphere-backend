@@ -1,4 +1,16 @@
-﻿node_modules/
+node_modules/
+
+# Keep credentials and machine-specific configuration local.
 .env
+.env.*
+!.env.example
 SECRETS_BACKUP.txt
+
+# Runtime user data and logs.
 uploads/
+logs/
+*.log
+
+coverage/
+.DS_Store
+Thumbs.db

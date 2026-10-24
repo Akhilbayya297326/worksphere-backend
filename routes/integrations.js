@@ -2,92 +2,97 @@ const express = require('express');
 const router = express.Router();
 const axios = require('axios');
 
-// GET: Omni-Stream (Aggregates GitHub Commits & Jira Tickets)
-router.get('/omni-feed', async (req, res) => {
+const REQUEST_TIMEOUT_MS = 8000;
+const validRepository = value => typeof value === 'string' && /^[\w.-]+\/[\w.-]+$/.test(value);
+
+function jiraOrigin() {
+  const domain = process.env.JIRA_DOMAIN?.trim();
+  if (!domain) return null;
   try {
-    let unifiedFeed = [];
-
-    // 1. ATTEMPT GITHUB API FETCH
-    try {
-      if (process.env.GITHUB_PAT && process.env.GITHUB_FRONTEND_REPO) {
-        const githubRes = await axios.get(`https://api.github.com/repos/${process.env.GITHUB_FRONTEND_REPO}/commits`, {
-          headers: { Authorization: `token ${process.env.GITHUB_PAT}` },
-          params: { per_page: 3 }
-        });
-        
-        const ghLogs = githubRes.data.map(commit => ({
-          id: commit.sha,
-          platform: 'GitHub',
-          type: 'COMMIT',
-          user: commit.commit.author.name,
-          message: commit.commit.message,
-          timestamp: commit.commit.author.date,
-          url: commit.html_url,
-          status: 'Success'
-        }));
-        unifiedFeed = [...unifiedFeed, ...ghLogs];
-      }
-    } catch (ghError) {
-      // Catch silently to fallback
-    }
-
-    // 2. ATTEMPT JIRA API FETCH
-    try {
-      if (process.env.JIRA_API_TOKEN && process.env.JIRA_DOMAIN) {
-        const authHeader = Buffer.from(`${process.env.JIRA_EMAIL}:${process.env.JIRA_API_TOKEN}`).toString('base64');
-        const jiraRes = await axios.get(`https://${process.env.JIRA_DOMAIN}/rest/api/3/search?jql=order by updated DESC&maxResults=3`, {
-          headers: { Authorization: `Basic ${authHeader}`, Accept: 'application/json' }
-        });
-
-        const jiraLogs = jiraRes.data.issues.map(issue => ({
-          id: issue.key,
-          platform: 'Jira',
-          type: 'TICKET_UPDATE',
-          user: issue.fields.creator?.displayName || 'Team Member',
-          message: `Updated ticket: ${issue.fields.summary}`,
-          timestamp: issue.fields.updated,
-          url: `https://${process.env.JIRA_DOMAIN}/browse/${issue.key}`,
-          status: issue.fields.status.name
-        }));
-        unifiedFeed = [...unifiedFeed, ...jiraLogs];
-      }
-    } catch (jiraError) {
-      // Catch silently to fallback
-    }
-
-    // 3. FAIL-SAFE / HACKATHON DEMO INJECTION
-    if (unifiedFeed.length === 0) {
-      unifiedFeed = [
-        { id: 'gh-1', platform: 'GitHub', type: 'COMMIT', user: 'Akhil Bayya', message: 'feat: integrated Gemini 1.5 Flash for Orchestration', timestamp: new Date(Date.now() - 15 * 60000), status: 'Merged' },
-        { id: 'ji-1', platform: 'Jira', type: 'TICKET_UPDATE', user: 'Lokesh', message: 'Moved RYT-42 (Fix payment gateway) to DONE', timestamp: new Date(Date.now() - 45 * 60000), status: 'Done' },
-        { id: 'co-1', platform: 'Confluence', type: 'DOC_UPDATE', user: 'System AI', message: 'Auto-generated Knowledge Base for Krishi Chakra', timestamp: new Date(Date.now() - 120 * 60000), status: 'Published' },
-        { id: 'gh-2', platform: 'GitHub', type: 'PULL_REQUEST', user: 'Akhil Bayya', message: 'PR #14: Optimize MongoDB aggregation pipelines', timestamp: new Date(Date.now() - 200 * 60000), status: 'Open' },
-        { id: 'ji-2', platform: 'Jira', type: 'TICKET_UPDATE', user: 'QA Team', message: 'Flagged RYT-39 for visual regression', timestamp: new Date(Date.now() - 300 * 60000), status: 'In Review' }
-      ];
-    }
-
-    unifiedFeed.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-
-    res.json({
-      success: true,
-      omniFeed: unifiedFeed,
-      systemHealth: { github: 'Operational', jira: 'Operational', webex: 'Operational', confluence: 'Operational' }
-    });
-
-  } catch (err) {
-    res.status(500).json({ success: false, error: 'Failed to aggregate toolchain data.' });
+    const url = new URL(domain.includes('://') ? domain : `https://${domain}`);
+    return url.protocol === 'https:' && !url.username && !url.password &&
+      (!url.pathname || url.pathname === '/') && !url.search && !url.hash ? url.origin : null;
+  } catch {
+    return null;
   }
+}
+
+// Providers run independently so one failure cannot block the other feed.
+router.get('/omni-feed', async (req, res) => {
+  const systemHealth = { github: 'Not configured', jira: 'Not configured', webex: 'Not monitored', confluence: 'Not monitored' };
+  const [githubFeed, jiraFeed] = await Promise.all([
+    (async () => {
+      const repository = process.env.GITHUB_FRONTEND_REPO?.trim();
+      const token = process.env.GITHUB_TOKEN?.trim() || process.env.GITHUB_PAT?.trim();
+      if (!repository || !token) return [];
+      systemHealth.github = 'Unavailable';
+      if (!validRepository(repository)) return [];
+      try {
+        const response = await axios.get(`https://api.github.com/repos/${repository}/commits`, {
+          headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json' },
+          params: { per_page: 3 }, timeout: REQUEST_TIMEOUT_MS, maxRedirects: 0
+        });
+        if (!Array.isArray(response.data)) throw new Error('Invalid GitHub response');
+        const feed = response.data.filter(commit => typeof commit?.sha === 'string' && commit.commit?.author &&
+          typeof commit.commit.message === 'string' && Number.isFinite(Date.parse(commit.commit.author.date)))
+          .map(commit => ({
+            id: commit.sha, platform: 'GitHub', type: 'COMMIT',
+            user: typeof commit.commit.author.name === 'string' ? commit.commit.author.name : 'Team Member', message: commit.commit.message,
+            timestamp: commit.commit.author.date, url: commit.html_url, status: 'Success'
+          }));
+        systemHealth.github = 'Operational';
+        return feed;
+      } catch {
+        return [];
+      }
+    })(),
+    (async () => {
+      const token = process.env.JIRA_API_TOKEN?.trim();
+      const email = process.env.JIRA_EMAIL?.trim();
+      if (!token || !email || !process.env.JIRA_DOMAIN?.trim()) return [];
+      systemHealth.jira = 'Unavailable';
+      const origin = jiraOrigin();
+      if (!origin) return [];
+      try {
+        const response = await axios.get(`${origin}/rest/api/3/search/jql`, {
+          headers: { Authorization: `Basic ${Buffer.from(`${email}:${token}`).toString('base64')}`, Accept: 'application/json' },
+          params: {
+            jql: 'updated >= -30d ORDER BY updated DESC', maxResults: 3,
+            fields: 'summary,creator,updated,status'
+          },
+          timeout: REQUEST_TIMEOUT_MS, maxRedirects: 0
+        });
+        if (!Array.isArray(response.data?.issues)) throw new Error('Invalid Jira response');
+        const feed = response.data.issues.filter(issue => typeof issue?.key === 'string' &&
+          typeof issue.fields?.summary === 'string' && Number.isFinite(Date.parse(issue.fields.updated)))
+          .map(issue => ({
+            id: issue.key, platform: 'Jira', type: 'TICKET_UPDATE',
+            user: typeof issue.fields.creator?.displayName === 'string' ? issue.fields.creator.displayName : 'Team Member',
+            message: `Updated ticket: ${issue.fields.summary}`, timestamp: issue.fields.updated,
+            url: `${origin}/browse/${encodeURIComponent(issue.key)}`, status: issue.fields.status?.name || 'Unknown'
+          }));
+        systemHealth.jira = 'Operational';
+        return feed;
+      } catch {
+        return [];
+      }
+    })()
+  ]);
+  const omniFeed = [...githubFeed, ...jiraFeed].sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
+  res.json({ success: true, omniFeed, systemHealth });
 });
 
-// GET: Static External Links
 router.get('/links', (req, res) => {
+  const frontendRepository = process.env.GITHUB_FRONTEND_REPO?.trim();
+  const backendRepository = process.env.GITHUB_BACKEND_REPO?.trim();
   res.json({
     success: true,
     links: {
-      githubFrontend: `https://github.com/${process.env.GITHUB_FRONTEND_REPO || 'Akhilbayya297326/krishichakra-frontend'}`,
-      githubBackend: `https://github.com/${process.env.GITHUB_BACKEND_REPO || 'Akhilbayya297326/Rythu-Mitra'}`,
-      jiraBoard: `https://${process.env.JIRA_DOMAIN || 'akhilbayya111.atlassian.net'}`,
-      webexWorkspace: `https://web.webex.com/meetings/${process.env.WEBEX_WORKSPACE || 'yourworkspace'}`
+      githubFrontend: validRepository(frontendRepository) ? `https://github.com/${frontendRepository}` : null,
+      githubBackend: validRepository(backendRepository) ? `https://github.com/${backendRepository}` : null,
+      jiraBoard: jiraOrigin(),
+      webexWorkspace: process.env.WEBEX_WORKSPACE?.trim()
+        ? `https://web.webex.com/meetings/${encodeURIComponent(process.env.WEBEX_WORKSPACE.trim())}` : null
     }
   });
 });

@@ -3,26 +3,47 @@ const mongoose = require('mongoose');
 const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
+const { randomUUID } = require('crypto');
 const router = express.Router();
 
-const { GoogleGenerativeAI } = require('@google/generative-ai');
-const genAI = process.env.GEMINI_API_KEY ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY) : null;
+const { generateJson, HttpError, sendError, isRecord, isStringArray, requireText } = require('../utils/ai');
+const { requireManager } = require('../middleware/auth');
 
 const Project = require('../models/Project');
 const AuditLog = require('../models/AuditLog');
 const Message = require('../models/Message'); // Required for system triggers
+const uploadDir = path.resolve(__dirname, '../uploads');
+
+for (const parameter of ['projectId', 'fileId', 'analysisId']) {
+  router.param(parameter, (req, res, next, id) => {
+    if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ success: false, error: `Invalid ${parameter}.` });
+    next();
+  });
+}
+
+function vaultPath(filename) {
+  if (typeof filename !== 'string' || filename === '.' || filename === '..' || /[\\/\x00:]/.test(filename)) {
+    throw new HttpError(400, 'Invalid vault filename.');
+  }
+  return path.join(uploadDir, filename);
+}
+
+async function removeUploadedFile(filePath) {
+  if (!filePath) return;
+  try { await fs.promises.unlink(filePath); } catch (error) {
+    if (error.code !== 'ENOENT') console.error('Failed to clean up vault file.');
+  }
+}
 
 // ==========================================
 // 🛡️ MULTER ENTERPRISE FILE STORAGE
 // ==========================================
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    const dir = './uploads';
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    cb(null, dir);
+    fs.mkdir(uploadDir, { recursive: true }, error => cb(error, uploadDir));
   },
   filename: (req, file, cb) => {
-    cb(null, Date.now() + '-' + Math.round(Math.random() * 1E9) + path.extname(file.originalname));
+    cb(null, randomUUID() + path.extname(file.originalname));
   }
 });
 const upload = multer({ storage: storage, limits: { fileSize: 50 * 1024 * 1024 } });
@@ -39,12 +60,19 @@ router.get('/audit-logs', async (req, res) => {
   }
 });
 
+router.get('/workspace-integrations', (req, res) => res.status(501).json({
+  success: false,
+  error: 'Workspace repository synchronization and Webex provisioning are unavailable: no connector is implemented.'
+}));
+
 router.get('/download/:filename', (req, res) => {
-  const filePath = path.join(__dirname, '../uploads', req.params.filename);
-  if (fs.existsSync(filePath)) {
-    res.download(filePath);
-  } else {
-    res.status(404).json({ success: false, error: 'File not found on server.' });
+  try {
+    const filePath = vaultPath(req.params.filename);
+    res.download(filePath, error => {
+      if (error && !res.headersSent) res.status(error.code === 'ENOENT' ? 404 : 500).json({ success: false, error: 'File unavailable on server.' });
+    });
+  } catch (error) {
+    sendError(res, error, 'Failed to download file.');
   }
 });
 
@@ -61,12 +89,19 @@ router.get('/', async (req, res) => {
 });
 
 // DELETE: 🚨 EMERGENCY PURGE - Clear all data (For Hackathon Resets)
-router.delete('/admin/purge-all', async (req, res) => {
+router.delete('/admin/purge-all', (req, res, next) => {
+  if (process.env.ENABLE_DESTRUCTIVE_RESET !== 'true' || process.env.NODE_ENV === 'production') {
+    return res.status(403).json({ success: false, error: 'Destructive resets are disabled.' });
+  }
+  return requireManager(req, res, next);
+}, async (req, res) => {
   try {
-    const uploadDir = './uploads';
     if (fs.existsSync(uploadDir)) {
       const files = fs.readdirSync(uploadDir);
-      for (const file of files) fs.unlinkSync(path.join(uploadDir, file));
+      for (const file of files) {
+        const filePath = vaultPath(file);
+        if (fs.statSync(filePath).isFile()) fs.unlinkSync(filePath);
+      }
     }
     await Project.deleteMany({});
     await AuditLog.deleteMany({});
@@ -93,7 +128,8 @@ router.get('/:projectId', async (req, res) => {
 
 router.put('/:projectId/status', async (req, res) => {
   try {
-    const { status, userId, reason } = req.body;
+    const { status, userId, reason } = req.body || {};
+    if (!Project.schema.path('status').enumValues.includes(status)) throw new HttpError(400, 'Invalid project status.');
     if (!mongoose.Types.ObjectId.isValid(req.params.projectId)) return res.status(400).json({ success: false, error: 'Invalid Project ID format.' });
     
     const project = await Project.findByIdAndUpdate(req.params.projectId, { $set: { status: status } }, { new: true, runValidators: true });
@@ -110,7 +146,7 @@ router.put('/:projectId/status', async (req, res) => {
     try { await AuditLog.create({ actionType, performedBy: userId || 'System_Auto', resourceId: project._id, details, securityLevel }); } catch (e) {}
     res.json({ success: true, project });
   } catch (err) {
-    res.status(500).json({ success: false, error: 'Failed to execute state transition.' });
+    sendError(res, err, 'Failed to execute state transition.');
   }
 });
 
@@ -123,13 +159,17 @@ router.post('/:projectId/upload', upload.single('file'), async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(req.params.projectId)) return res.status(400).json({ success: false, error: 'Invalid Project ID.' });
 
     const project = await Project.findById(req.params.projectId);
-    if (!project) return res.status(404).json({ success: false, error: 'Project not found.' });
+    if (!project) {
+      await removeUploadedFile(req.file.path);
+      return res.status(404).json({ success: false, error: 'Project not found.' });
+    }
 
     const newFile = { originalName: req.file.originalname, filename: req.file.filename, path: req.file.path, mimetype: req.file.mimetype, size: req.file.size, uploadedBy: req.body.uploaderName || 'Unknown User' };
     project.files.push(newFile);
     await project.save();
-    res.json({ success: true, file: newFile, message: 'File securely vaulted.' });
+    res.json({ success: true, file: project.files[project.files.length - 1], message: 'File securely vaulted.' });
   } catch (err) {
+    await removeUploadedFile(req.file?.path);
     res.status(500).json({ success: false, error: 'Failed to upload file.' });
   }
 });
@@ -142,10 +182,10 @@ router.delete('/:projectId/files/:fileId', async (req, res) => {
 
     const fileToDelete = project.files.id(req.params.fileId);
     if (fileToDelete) {
-      const filePath = path.join(__dirname, '../uploads', fileToDelete.filename);
-      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      const filePath = vaultPath(fileToDelete.filename);
       project.files.pull(req.params.fileId);
       await project.save();
+      await removeUploadedFile(filePath);
       res.json({ success: true, message: 'File successfully deleted.' });
     } else {
       res.status(404).json({ success: false, error: 'File not found.' });
@@ -164,14 +204,12 @@ router.post('/:projectId/vault-analysis', async (req, res) => {
     if (!project) return res.status(404).json({ success: false, error: 'Project not found.' });
 
     const fileNames = project.files.map(f => f.originalName).join(', ');
-    const requesterName = req.body.requesterName || 'System User';
-    let insightContent = "";
-
-    if (genAI && project.files.length > 0) {
-      const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash', generationConfig: { temperature: 0.2, responseMimeType: 'application/json' } });
-      const prompt = `You are a Senior Technical Project Manager. Project Name: ${project.title}. 
+    const requesterName = req.body?.requesterName || 'System User';
+    if (!project.files.length) throw new HttpError(400, 'Upload at least one file before requesting vault analysis.');
+    const prompt = `You are a Senior Technical Project Manager. Project Name: ${project.title}.
       The team uploaded these files: ${fileNames}.
-      Review context and generate analysis. 
+      Only filenames and project context are available; file contents have NOT been read.
+      State this limitation and suggest a review plan without claiming to have verified document contents.
       Use EXACT JSON schema:
       {
         "projectSummary": "A 4-sentence executive summary.",
@@ -184,31 +222,17 @@ router.post('/:projectId/vault-analysis', async (req, res) => {
         "constraints": [ "Estimated Budget/Timeline limits: ...", "Legal/Industry Dependencies: ..." ]
       }`;
       
-      const result = await model.generateContent(prompt);
-      let rawText = result.response.text().replace(/```json/gi, '').replace(/```/g, '').trim();
-      
-      try {
-          JSON.parse(rawText);
-          insightContent = rawText; 
-      } catch (e) {
-          insightContent = JSON.stringify({ projectSummary: "Failed to format JSON perfectly. Raw Output: " + rawText });
-      }
-    } else {
-      insightContent = JSON.stringify({
-        projectSummary: `Analyzed ${project.files.length} active documents. AI offline or Vault empty.`,
-        businessRequirements: ["System analysis incomplete."],
-        securityMeasures: ["Proceed with manual Zero-Trust."]
-      });
-    }
+    const insight = await generateJson(prompt, value => typeof value.projectSummary === 'string'
+      && ['analysisWorkflows', 'businessRequirements', 'functionalReqs', 'nonFunctionalReqs', 'securityMeasures', 'technicalEnv', 'constraints'].every(key => isStringArray(value[key])), { temperature: 0.2 });
+    const insightContent = JSON.stringify(insight);
 
     const newAnalysis = { title: `Deep Vault Scan: ${new Date().toLocaleDateString()}`, content: insightContent, generatedBy: requesterName };
     project.vaultAnalyses.push(newAnalysis);
     await project.save();
 
-    res.json({ success: true, analysis: newAnalysis, message: 'Analysis generated and saved.' });
+    res.json({ success: true, analysis: project.vaultAnalyses[project.vaultAnalyses.length - 1], message: 'Filename-based review plan generated and saved.' });
   } catch (err) {
-    console.error("AI Vault Analysis Error:", err);
-    res.status(500).json({ success: false, error: 'Failed to generate AI analysis.' });
+    sendError(res, err, 'Failed to generate AI analysis.');
   }
 });
 
@@ -216,6 +240,7 @@ router.delete('/:projectId/vault-analysis/:analysisId', async (req, res) => {
   try {
     const project = await Project.findById(req.params.projectId);
     if (!project) return res.status(404).json({ success: false, error: 'Project not found.' });
+    if (!project.vaultAnalyses.id(req.params.analysisId)) return res.status(404).json({ success: false, error: 'Analysis not found.' });
     project.vaultAnalyses.pull(req.params.analysisId);
     await project.save();
     res.json({ success: true, message: 'Analysis permanently deleted.' });
@@ -229,29 +254,11 @@ router.delete('/:projectId/vault-analysis/:analysisId', async (req, res) => {
 // ==========================================
 router.post('/:projectId/agent-swarm', async (req, res) => {
   try {
-    const { codeSnippet, errorLogs } = req.body;
-
-    if (!genAI) {
-      return res.json({
-        success: true,
-        swarmData: {
-          swarmDebate: [
-            { agent: "Arch-AI", message: "Analyzing code pattern... Structure lacks centralized input sanitization and try/catch boundaries." },
-            { agent: "Sec-AI", message: "CRITICAL VULNERABILITY DETECTED: Execution vector allows raw SQL injection and token leakage!" },
-            { agent: "QA-AI", message: "Edge-case test failed: Passing 'undefined' or empty payload crashes the main execution thread." },
-            { agent: "Arch-AI", message: "Proposing a parameterized query architecture with async exception wrappers." },
-            { agent: "Sec-AI", message: "Vetting patch... Cryptographic parameters validated. Zero-trust check passed." }
-          ],
-          consensusReached: "100% Consensus Reached: Input parameterization applied, memory leaks eliminated, and security boundaries verified.",
-          finalPatchedCode: `// 🛡️ AUTONOMOUS SWARM AUDITED & PATCHED CODE\nasync function executeSecureQuery(inputParam) {\n    try {\n        if (!inputParam || typeof inputParam !== 'string') {\n            throw new Error("Invalid or Malformed Parameter");\n        }\n        // Parameterized prepared statement preventing SQL Injection\n        const query = "SELECT * FROM enterprise_data WHERE id = $1";\n        const result = await db.query(query, [inputParam]);\n        return result.rows;\n    } catch (error) {\n        console.error("[Swarm Guard Alert]:", error.message);\n        return null;\n    }\n}`
-        }
-      });
-    }
-
-    const model = genAI.getGenerativeModel({
-      model: 'gemini-2.5-flash',
-      generationConfig: { temperature: 0.3, responseMimeType: 'application/json' }
-    });
+    const { codeSnippet, errorLogs } = req.body || {};
+    requireText(codeSnippet, 'Code snippet');
+    if (errorLogs !== undefined && typeof errorLogs !== 'string') throw new HttpError(400, 'Error context must be a string.');
+    const project = await Project.findById(req.params.projectId);
+    if (!project) return res.status(404).json({ success: false, error: 'Project not found.' });
 
     const prompt = `
       You are simulating an autonomous "Agent Swarm" debugging software.
@@ -275,30 +282,34 @@ router.post('/:projectId/agent-swarm', async (req, res) => {
       }
     `;
 
-    const result = await model.generateContent(prompt);
-    let rawText = result.response.text().replace(/```json/gi, '').replace(/```/g, '').trim();
-
-    res.json({ success: true, swarmData: JSON.parse(rawText) });
+    const swarmData = await generateJson(prompt, value => Array.isArray(value.swarmDebate)
+      && value.swarmDebate.length > 0 && value.swarmDebate.every(turn => isRecord(turn)
+        && typeof turn.agent === 'string' && typeof turn.message === 'string')
+      && typeof value.consensusReached === 'string' && typeof value.finalPatchedCode === 'string', { temperature: 0.3 });
+    res.json({ success: true, swarmData });
   } catch (err) {
-    console.error("Swarm Error:", err);
-    res.status(500).json({ success: false, error: 'Agent Swarm simulation failed.' });
+    sendError(res, err, 'Agent Swarm simulation failed.');
   }
 });
 
 // ==========================================
-// 🚀 1-CLICK APPLY PATCH & COMMIT ROUTE
+// Save a suggested patch for review
 // ==========================================
 router.post('/:projectId/apply-patch', async (req, res) => {
+  let filePath;
+  let saved = false;
   try {
-    const { patchedCode, commitMessage, uploaderName } = req.body;
+    const { patchedCode, commitMessage, uploaderName } = req.body || {};
+    requireText(patchedCode, 'Patched code');
     const project = await Project.findById(req.params.projectId);
 
     if (!project) return res.status(404).json({ success: false, error: 'Project not found.' });
 
-    // 1. Physically compile file to uploads folder
-    const fileName = `SwarmFix-${Date.now().toString().slice(-6)}.js`;
-    const filePath = path.join(__dirname, '../uploads', fileName);
-    fs.writeFileSync(filePath, patchedCode);
+    // Store the suggested patch as a vault artifact; this does not execute code or modify a repository.
+    const fileName = `SwarmFix-${randomUUID()}.js`;
+    filePath = vaultPath(fileName);
+    await fs.promises.mkdir(uploadDir, { recursive: true });
+    await fs.promises.writeFile(filePath, patchedCode, { flag: 'wx' });
 
     // 2. Vault the physical file in MongoDB
     const newFile = {
@@ -312,26 +323,30 @@ router.post('/:projectId/apply-patch', async (req, res) => {
 
     project.files.push(newFile);
     await project.save();
+    saved = true;
 
-    // 3. Broadcast commit to global chat
+    // 3. Announce the saved artifact without failing a successful save on notification errors.
     const io = req.app.get('io');
     if (io) {
-      const commitHash = Math.random().toString(16).slice(2, 9).toUpperCase();
-      const announcement = await Message.create({
-        author: 'GitHub Actions Bot',
-        role: 'CI/CD Engine',
-        isBot: true,
-        channel: 'engineering',
-        urgent: false,
-        text: `✅ SWARM PATCH MERGED & VAULTED\n\nCommit Hash: #${commitHash}\nFile: ${fileName}\nSummary: ${commitMessage}\n\nThe patch has been compiled, vaulted, and pushed to the main development branch.`
-      });
-      io.emit('receive_message', announcement);
+      try {
+        const announcement = await Message.create({
+          author: 'WorkSphere Bot',
+          role: 'Patch Review',
+          isBot: true,
+          channel: 'engineering',
+          urgent: false,
+          text: `Suggested patch saved to project vault.\n\nFile: ${fileName}\nSummary: ${typeof commitMessage === 'string' ? commitMessage : 'Review the suggested patch before applying it to your repository.'}`
+        });
+        io.emit('receive_message', announcement);
+      } catch (error) {
+        console.error('Patch saved, but chat notification failed.');
+      }
     }
 
-    res.json({ success: true, message: 'Patch merged and vaulted.' });
+    res.json({ success: true, file: project.files[project.files.length - 1], message: 'Suggested patch saved to the vault for review.' });
   } catch (err) {
-    console.error("Apply Patch Error:", err);
-    res.status(500).json({ success: false, error: 'Failed to apply patch.' });
+    if (!saved) await removeUploadedFile(filePath);
+    sendError(res, err, 'Failed to save suggested patch.');
   }
 });
 

@@ -1,5 +1,5 @@
 const mongoose = require('mongoose');
-require('dotenv').config();
+require('dotenv').config({ path: require('path').join(__dirname, '.env') });
 const Employee = require('./models/Employee');
 
 const dummyEmployees = [

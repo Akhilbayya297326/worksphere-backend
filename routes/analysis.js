@@ -1,44 +1,21 @@
 const express = require('express');
 const router = express.Router();
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+const { generateJson, HttpError, sendError, requireText, isRecord } = require('../utils/ai');
 const Employee = require('../models/Employee'); // We pull this to give the AI live DB context
-
-// Initialize Gemini
-const genAI = process.env.GEMINI_API_KEY ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY) : null;
 
 // POST: Elite Enterprise Document Analysis & Workforce Routing
 router.post('/analyze-doc', async (req, res) => {
   try {
-    const { text, documentData } = req.body;
-    const contentToAnalyze = text || documentData;
-
-    if (!contentToAnalyze) {
-      return res.status(400).json({ success: false, error: 'No document text provided for analysis.' });
-    }
+    const { text, documentData } = req.body || {};
+    const contentToAnalyze = requireText(text ?? documentData, 'Document text');
+    if (!process.env.GEMINI_API_KEY?.trim()) throw new HttpError(503, 'AI service is not configured. Set GEMINI_API_KEY on the backend.');
 
     // 1. Fetch live workforce data to simulate the "Find Employees Tool"
     const availableWorkforce = await Employee.find({ availability: 'Available' }).select('name role skills experienceYears');
     const workforceContext = availableWorkforce.map(emp => 
-      `Name: ${emp.name}, Role: ${emp.role}, Skills: ${emp.skills.join(', ')}`
+      `Name: ${emp.name}, Role: ${emp.role}, Skills: ${(emp.skills || []).join(', ')}`
     ).join('\n');
-
-    // 2. Fallback for testing if Gemini API key isn't set yet
-    if (!genAI) {
-      console.warn("⚠️ GEMINI_API_KEY not found. Using presentation mock data.");
-      return res.json({
-        success: true,
-        analysis: {
-          projectSummary: "Mock analysis due to missing API key.",
-          tasks: [{ title: 'System Architecture', description: 'Design DB schema', complexity: 'High' }]
-        }
-      });
-    }
-
-    // 3. Real Gemini AI Orchestration (Deep Document Analysis)
-    const model = genAI.getGenerativeModel({ 
-      model: 'gemini-2.5-flash', // Lightning fast for JSON parsing
-      generationConfig: { temperature: 0.1 } // Low temperature for high precision/logic
-    });
+    if (!availableWorkforce.length) throw new HttpError(400, 'No available employees found for this project.');
     
     const prompt = `
       You are an Elite Enterprise Software Architect and WorkSphere AI, an expert resource allocation AI. 
@@ -79,18 +56,17 @@ router.post('/analyze-doc', async (req, res) => {
     `;
 
     console.log("🤖 Enterprise Orchestrator active. Initiating Document Analysis...");
-    const result = await model.generateContent(prompt);
-    
-    // 4. Bulletproof JSON Parsing
-    let responseText = result.response.text().replace(/```json/gi, '').replace(/```/g, '').trim();
-    
-    let parsedAnalysis;
-    try {
-      parsedAnalysis = JSON.parse(responseText);
-    } catch (parseError) {
-      console.error("AI JSON Formatting Error. Attempting regex extraction...", parseError);
-      return res.status(500).json({ success: false, error: 'AI Orchestrator failed to format output correctly.' });
-    }
+    const parsedAnalysis = await generateJson(prompt, data =>
+      typeof data.projectSummary === 'string' && Array.isArray(data.aiShortlist) &&
+      data.aiShortlist.every(person => isRecord(person) && typeof person.name === 'string') &&
+      Array.isArray(data.tasks) && data.tasks.length > 0 && data.tasks.every(task =>
+        isRecord(task) && typeof task.title === 'string' && task.title.trim() &&
+        typeof task.description === 'string' && ['High', 'Medium', 'Low'].includes(task.complexity)));
+    parsedAnalysis.aiShortlist = parsedAnalysis.aiShortlist.flatMap(person => {
+      const employee = availableWorkforce.find(item => item.name === person.name);
+      return employee ? [{ name: employee.name, role: employee.role, reason: typeof person.reason === 'string' ? person.reason : '' }] : [];
+    });
+    if (!parsedAnalysis.aiShortlist.length) throw new HttpError(502, 'AI service did not select any available employees. Please try again.');
 
     console.log("✅ AI Orchestration Complete. JSON structured successfully.");
     
@@ -102,8 +78,7 @@ router.post('/analyze-doc', async (req, res) => {
     });
 
   } catch (err) {
-    console.error("AI Analysis Error:", err);
-    res.status(500).json({ success: false, error: 'AI Orchestration engine failed to process the document.' });
+    sendError(res, err, 'AI Orchestration engine failed to process the document.');
   }
 });
 

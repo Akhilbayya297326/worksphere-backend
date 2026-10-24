@@ -1,17 +1,11 @@
 const express = require('express');
 const router = express.Router();
-const { GoogleGenerativeAI } = require('@google/generative-ai');
-
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const { generateJson, sendError, requireText, isStringArray } = require('../utils/ai');
 
 // POST: Query the Enterprise GitHub Codebase
 router.post('/query', async (req, res) => {
   try {
-    const { query } = req.body;
-    
-    if (!query) {
-      return res.status(400).json({ success: false, error: 'Codebase query is required.' });
-    }
+    const query = requireText(req.body?.query, 'Codebase query', 10000);
 
     // 1. Simulated Vector Database of Company GitHub Repositories
     // In a live production environment, this data would be fetched from ChromaDB after 
@@ -43,15 +37,6 @@ router.post('/query', async (req, res) => {
       Methodology: All MongoDB models must include Mongoose timestamps (createdAt, updatedAt) and use strict schema validation to prevent NoSQL injection.
     `;
 
-    // 2. Configure Gemini Model with Native JSON Structuring
-    const model = genAI.getGenerativeModel({ 
-      model: 'gemini-2.5-flash',
-      generationConfig: { 
-        temperature: 0.1, // Highly factual, strict adherence to company code
-        responseMimeType: 'application/json' 
-      } 
-    });
-
     // 3. Precision Prompting for Codebase Engineering
     const prompt = `
       You are the WorkSphere AI Senior Staff Engineer.
@@ -79,14 +64,15 @@ router.post('/query', async (req, res) => {
     `;
 
     // 4. Generate & Parse
-    const result = await model.generateContent(prompt);
-    const structuredCodeData = JSON.parse(result.response.text());
+    const structuredCodeData = await generateJson(prompt, data =>
+      typeof data.overview === 'string' && typeof data.companyMethodology === 'string' &&
+      (data.reusableCode === null || typeof data.reusableCode === 'string') &&
+      typeof data.sourceRepository === 'string' && isStringArray(data.actionableAdvice));
 
-    res.json({ success: true, data: structuredCodeData });
+    res.json({ success: true, data: structuredCodeData, contextType: 'sample' });
 
   } catch (err) {
-    console.error("Codebase Copilot Error:", err);
-    res.status(500).json({ success: false, error: 'Failed to query enterprise codebase.' });
+    sendError(res, err, 'Failed to query enterprise codebase.');
   }
 });
 
