@@ -12,7 +12,7 @@ const { requireManager } = require('../middleware/auth');
 const Project = require('../models/Project');
 const AuditLog = require('../models/AuditLog');
 const Message = require('../models/Message'); // Required for system triggers
-const uploadDir = path.resolve(__dirname, '../uploads');
+const uploadDir = path.resolve(process.env.UPLOAD_DIR || path.join(__dirname, '../uploads'));
 
 for (const parameter of ['projectId', 'fileId', 'analysisId']) {
   router.param(parameter, (req, res, next, id) => {

@@ -4,14 +4,18 @@ Express, MongoDB/Mongoose, and Socket.IO API for WorkSphere projects, talent, ch
 
 ## Run locally
 
-Requires Node.js 22.12 or newer, npm, and a reachable MongoDB database.
+Requires Node.js 24, npm, and a reachable MongoDB database.
 
 1. Run `npm ci`.
 2. Copy `.env.example` to `.env` and configure the values below.
 3. Run `npm run doctor` to check configuration and MongoDB access.
 4. Run `npm start`, or `npm run dev` for automatic restarts during development.
 
-The default port is `5000`. Startup waits for MongoDB and exits with an error if the database connection or HTTP listener fails. Uploaded files and suggested patches are stored in the local `uploads/` directory, which is created when needed and excluded from Git. Use persistent storage for this directory when hosting.
+The default port is `5000`. Startup waits for MongoDB and exits with an error if the database connection or HTTP listener fails. Uploaded files and suggested patches use `UPLOAD_DIR` when configured, otherwise the local `uploads/` directory. Use persistent storage for this directory when hosting.
+
+## Deploy to Render
+
+The root `render.yaml` configures a Free Node web service with `npm ci --omit=dev`, `npm start`, and `/api/health/ready`. Leave the hosting Root Directory empty because this repository already contains the backend at its root. Supply MongoDB and CORS settings through Render; secrets are not stored in the Blueprint. Follow [DEPLOYMENT.md](DEPLOYMENT.md) for the Render/Vercel setup and storage limits.
 
 ## Environment
 

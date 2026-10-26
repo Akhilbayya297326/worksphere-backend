@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: worksphere-backend
+    runtime: node
+    region: singapore
+    plan: free
+    branch: main
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+    healthCheckPath: /api/health/ready
+    autoDeployTrigger: commit
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "24"
+      - key: DB_CONNECT_TIMEOUT_MS
+        value: "15000"
+      - key: MONGO_URI
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
