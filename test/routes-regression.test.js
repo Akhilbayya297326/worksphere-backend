@@ -268,6 +268,101 @@ test('invalid project statuses do not perform an update', async t => {
   assert.equal(update.mock.callCount(), 0);
 });
 
+test('invalid task and project IDs are rejected before database access', async t => {
+  const find = t.mock.method(Project, 'findById', () => { throw new Error('Unexpected database call'); });
+  for (const endpoint of [
+    `/projects/${validId}/tasks/bad-id`,
+    `/projects/bad-id/tasks/${validId}`,
+  ]) {
+    const result = await request(t, endpoint, json('PUT', { status: 'In Progress' }));
+    assert.equal(result.status, 400);
+    assert.equal(result.data.success, false);
+  }
+  assert.equal(find.mock.callCount(), 0);
+});
+
+test('invalid task statuses cause no database reads or mutations', async t => {
+  const find = t.mock.method(Project, 'findById', () => { throw new Error('Unexpected database call'); });
+  const save = t.mock.method(Project.prototype, 'save', () => { throw new Error('Unexpected mutation'); });
+  for (const status of [undefined, 'Unknown', '', ['Completed'], { $ne: null }, 'toString']) {
+    const result = await request(t, `/projects/${validId}/tasks/${validId}`, json('PUT', { status }));
+    assert.equal(result.status, 400);
+    assert.match(result.data.error, /Invalid task status/);
+  }
+  assert.equal(find.mock.callCount(), 0);
+  assert.equal(save.mock.callCount(), 0);
+});
+
+test('task updates return 404 for a missing project or missing task without saving', async t => {
+  let project = null;
+  t.mock.method(Project, 'findById', async () => project);
+  const save = t.mock.method(Project.prototype, 'save', () => { throw new Error('Unexpected mutation'); });
+  let result = await request(t, `/projects/${validId}/tasks/${validId}`, json('PUT', { status: 'Completed' }));
+  assert.equal(result.status, 404);
+  assert.equal(result.data.error, 'Project not found.');
+  project = new Project({ title: 'Task test', allocatedTasks: [{ title: 'Existing task', status: 'To Do' }] });
+  result = await request(t, `/projects/${validId}/tasks/${validId}`, json('PUT', { status: 'Completed' }));
+  assert.equal(result.status, 404);
+  assert.equal(result.data.error, 'Task not found.');
+  assert.equal(project.allocatedTasks[0].status, 'To Do');
+  assert.equal(save.mock.callCount(), 0);
+});
+
+test('task updates persist every canonical status and normalize legacy aliases before notifying', async t => {
+  let project;
+  const steps = [];
+  t.mock.method(Project, 'findById', async id => { assert.equal(id, validId); return project; });
+  const save = t.mock.method(Project.prototype, 'save', async function () {
+    await this.validate();
+    steps.push(['saved', this.allocatedTasks[0].status]);
+    return this;
+  });
+  app.set('io', { emit: event => { steps.push(['emitted', event]); } });
+  t.after(() => app.set('io', undefined));
+  for (const [requested, expected] of [
+    ['To Do', 'To Do'], ['In Progress', 'In Progress'], ['Awaiting QA', 'Awaiting QA'],
+    ['Completed', 'Completed'], ['Done', 'Awaiting QA'], ['Approved', 'Completed'],
+  ]) {
+    project = new Project({ title: 'Task test', allocatedTasks: [{ title: 'Build API', status: 'To Do' }] });
+    const taskId = String(project.allocatedTasks[0]._id);
+    const result = await request(t, `/projects/${validId}/tasks/${taskId}`, json('PUT', { status: requested, title: 'Injected title', assignedTo: validId }));
+    assert.equal(result.status, 200);
+    assert.equal(result.data.success, true);
+    assert.equal(result.data.task._id, taskId);
+    assert.equal(result.data.task.status, expected);
+    assert.equal(result.data.project.allocatedTasks[0].status, expected);
+    assert.equal(project.allocatedTasks[0].title, 'Build API');
+    assert.equal(project.allocatedTasks[0].assignedTo, undefined);
+    assert.deepEqual(steps.splice(0), [['saved', expected], ['emitted', 'workspace_updated']]);
+  }
+  assert.equal(save.mock.callCount(), 6);
+});
+
+test('task save failures return an error without emitting a workspace update', async t => {
+  const project = new Project({ title: 'Task test', allocatedTasks: [{ title: 'Build API' }] });
+  t.mock.method(Project, 'findById', async () => project);
+  t.mock.method(project, 'save', async () => { throw new Error('Database unavailable'); });
+  const emit = t.mock.fn(() => {});
+  app.set('io', { emit });
+  t.after(() => app.set('io', undefined));
+  const result = await request(t, `/projects/${validId}/tasks/${project.allocatedTasks[0]._id}`, json('PUT', { status: 'In Progress' }));
+  assert.equal(result.status, 500);
+  assert.equal(result.data.success, false);
+  assert.equal(emit.mock.callCount(), 0);
+});
+
+test('a committed task update succeeds when workspace notification throws', async t => {
+  const project = new Project({ title: 'Task test', allocatedTasks: [{ title: 'Build API' }] });
+  t.mock.method(Project, 'findById', async () => project);
+  const save = t.mock.method(project, 'save', async () => project);
+  app.set('io', { emit: () => { throw new Error('Socket unavailable'); } });
+  t.after(() => app.set('io', undefined));
+  const result = await request(t, `/projects/${validId}/tasks/${project.allocatedTasks[0]._id}`, json('PUT', { status: 'Completed' }));
+  assert.equal(result.status, 200);
+  assert.equal(result.data.task.status, 'Completed');
+  assert.equal(save.mock.callCount(), 1);
+});
+
 test('destructive purge is disabled by default and never deletes data', async t => {
   mockEnv(t, 'ENABLE_DESTRUCTIVE_RESET', 'false');
   const projectDelete = t.mock.method(Project, 'deleteMany', () => { throw new Error('Unexpected deletion'); });

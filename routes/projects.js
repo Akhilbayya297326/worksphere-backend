@@ -14,7 +14,7 @@ const AuditLog = require('../models/AuditLog');
 const Message = require('../models/Message'); // Required for system triggers
 const uploadDir = path.resolve(process.env.UPLOAD_DIR || path.join(__dirname, '../uploads'));
 
-for (const parameter of ['projectId', 'fileId', 'analysisId']) {
+for (const parameter of ['projectId', 'fileId', 'analysisId', 'taskId']) {
   router.param(parameter, (req, res, next, id) => {
     if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ success: false, error: `Invalid ${parameter}.` });
     next();
@@ -147,6 +147,35 @@ router.put('/:projectId/status', async (req, res) => {
     res.json({ success: true, project });
   } catch (err) {
     sendError(res, err, 'Failed to execute state transition.');
+  }
+});
+
+router.put('/:projectId/tasks/:taskId', async (req, res) => {
+  try {
+    const requestedStatus = req.body?.status;
+    const aliases = new Map([['Done', 'Awaiting QA'], ['Approved', 'Completed']]);
+    const status = aliases.get(requestedStatus) || requestedStatus;
+    if (typeof status !== 'string' || !['To Do', 'In Progress', 'Awaiting QA', 'Completed'].includes(status)) {
+      throw new HttpError(400, 'Invalid task status.');
+    }
+
+    const project = await Project.findById(req.params.projectId);
+    if (!project) return res.status(404).json({ success: false, error: 'Project not found.' });
+    const task = project.allocatedTasks.id(req.params.taskId);
+    if (!task) return res.status(404).json({ success: false, error: 'Task not found.' });
+
+    task.status = status;
+    await project.save();
+    // Notification failures must not turn a committed task update into an error.
+    try {
+      const io = req.app.get('io');
+      if (io) io.emit('workspace_updated');
+    } catch {
+      console.error('Task updated, but workspace notification failed.');
+    }
+    return res.json({ success: true, task, project });
+  } catch (error) {
+    return sendError(res, error, 'Failed to update task status.');
   }
 });
 
